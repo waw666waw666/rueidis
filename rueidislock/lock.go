@@ -432,7 +432,9 @@ func (m *locker) Close() {
 
 var (
 	delkey = rueidis.NewLuaScriptRetryable(`if redis.call("GET",KEYS[1]) == ARGV[1] then return redis.call("DEL",KEYS[1]) end;return 0`)
-	extend = rueidis.NewLuaScriptRetryable(`if redis.call("GET",KEYS[1]) == ARGV[1] then local r = redis.call("PEXPIREAT",KEYS[1],ARGV[2]);redis.call("GET",KEYS[1]);return r end;return 0`)
+	// extend skips PEXPIREAT when the key already expires at ARGV[2]: that write would be a no-op, and without NOLOOP
+	// its invalidation comes back to us and triggers another extend with the same deadline, in a tight loop.
+	extend = rueidis.NewLuaScriptRetryable(`if redis.call("GET",KEYS[1]) == ARGV[1] then if redis.pcall("PEXPIRETIME",KEYS[1]) == tonumber(ARGV[2]) then return 1 end;local r = redis.call("PEXPIREAT",KEYS[1],ARGV[2]);redis.call("GET",KEYS[1]);return r end;return 0`)
 	acqms  = rueidis.NewLuaScriptRetryable(`local r = redis.call("SET",KEYS[1],ARGV[1],"NX","PX",ARGV[2]);redis.call("GET",KEYS[1]);return r`)
 	acqat  = rueidis.NewLuaScriptRetryable(`local r = redis.call("SET",KEYS[1],ARGV[1],"NX","PXAT",ARGV[2]);redis.call("GET",KEYS[1]);return r`)
 	fcqms  = rueidis.NewLuaScriptRetryable(`local r = redis.call("SET",KEYS[1],ARGV[1],"PX",ARGV[2]);redis.call("GET",KEYS[1]);return r`)

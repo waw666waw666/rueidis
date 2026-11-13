@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -865,4 +866,62 @@ func TestLocker_Flush(t *testing.T) {
 			test(t, true, true, nocsc)
 		})
 	}
+}
+
+type evalCountingClient struct {
+	rueidis.Client
+	evals *atomic.Int64
+}
+
+func (c *evalCountingClient) Do(ctx context.Context, cmd rueidis.Completed) rueidis.RedisResult {
+	if cmds := cmd.Commands(); len(cmds) > 0 && (cmds[0] == "EVALSHA" || cmds[0] == "EVAL") {
+		c.evals.Add(1)
+	}
+	return c.Client.Do(ctx, cmd)
+}
+
+func TestLocker_WithContext_ExtendDoesNotLoopOnOwnInvalidations(t *testing.T) {
+	test := func(t *testing.T, noLoop bool) {
+		var evals atomic.Int64
+		l, err := NewLocker(LockerOption{
+			ClientOption: rueidis.ClientOption{InitAddress: address, SelectDB: testDB},
+			ClientBuilder: func(option rueidis.ClientOption) (rueidis.Client, error) {
+				client, err := rueidis.NewClient(option)
+				if err != nil {
+					return nil, err
+				}
+				return &evalCountingClient{Client: client, evals: &evals}, nil
+			},
+			KeyValidity:    time.Second,
+			ExtendInterval: 100 * time.Millisecond,
+			NoLoopTracking: noLoop,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+
+		ctx, cancel, err := l.WithContext(context.Background(), strconv.Itoa(rand.Int()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel()
+
+		start := evals.Load()
+		time.Sleep(time.Second)
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("lock lost while held: %v", err)
+		}
+		// 3 keys extended about every 100ms, plus at most one check per extend when our own
+		// writes are reported back to us (no NOLOOP).
+		if calls := evals.Load() - start; calls > 100 {
+			t.Fatalf("too many scripts sent while holding the lock for 1s: %d", calls)
+		}
+	}
+	t.Run("Tracking Loop", func(t *testing.T) {
+		test(t, false)
+	})
+	t.Run("Tracking NoLoop", func(t *testing.T) {
+		test(t, true)
+	})
 }
